@@ -79,6 +79,61 @@ def extract_download_candidates(obj: Any) -> List[Dict[str, str]]:
     return unique
 
 
+async def get_turnstile_or_captcha_token(page: Page) -> str:
+    """Intenta obtener el token captcha/turnstile que DIAN envía como parámetro captcha."""
+    try:
+        value = await page.evaluate("""() => {
+            const selectors = [
+              'input[name="cf-turnstile-response"]',
+              'textarea[name="cf-turnstile-response"]',
+              '[name="cf-turnstile-response"]',
+              'input[name="captcha"]',
+              'textarea[name="captcha"]'
+            ];
+            for (const s of selectors) {
+              const el = document.querySelector(s);
+              if (el && el.value) return el.value;
+            }
+            if (window.turnstileToken) return window.turnstileToken;
+            return '';
+        }""")
+        return value or ""
+    except Exception:
+        return ""
+
+
+def candidates_from_documents_json(data: Any, captcha: str = "") -> List[Dict[str, str]]:
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("data") or []
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("DocumentTypeId")) not in {"01", "91", "92"}:
+            continue
+        for field in ["Identifier", "TokenConsulta", "Id"]:
+            track = row.get(field)
+            if not track:
+                continue
+            c = {
+                "trackId": str(track),
+                "field": field,
+                "serie": row.get("SerieAndNumber"),
+                "sender": row.get("SenderName"),
+            }
+            if captcha:
+                c["captcha"] = captcha
+                c["url"] = f"{DIAN_BASE}/Document/DownloadZipFiles?trackId={track}&captcha={captcha}"
+            out.append(c)
+    seen=set(); unique=[]
+    for c in out:
+        key=(c.get('trackId'), c.get('field'))
+        if key not in seen:
+            seen.add(key); unique.append(c)
+    return unique
+
+
 @dataclass
 class DownloadedFile:
     name: str
@@ -321,6 +376,11 @@ class DianSyncService:
             if not candidates:
                 candidates = extract_download_candidates(query["raw"])
 
+            captcha_token = await get_turnstile_or_captcha_token(page)
+            json_candidates = candidates_from_documents_json(query["data"], captcha_token)
+            if json_candidates:
+                candidates = json_candidates + candidates
+
             if not candidates:
                 dom_links = await self._dom_search_download_links(page, start_date, end_date, max_documents)
                 candidates = [{"url": u, "source": "dom"} for u in dom_links]
@@ -353,6 +413,7 @@ class DianSyncService:
                 "upload_result": upload_result,
                 "query_preview": query["raw"][:3000],
                 "query_data_keys": list(query["data"].keys()) if isinstance(query["data"], dict) else [],
+                "captcha_token_found": bool(captcha_token),
                 "session_or_role_page_detected": ("login-wrapper" in query["raw"] or "Administrador" in query["raw"]),
                 "note": "Si session_or_role_page_detected es true, DIAN devolvió pantalla de selección de rol/sesión en vez de JSON. El servicio intenta seleccionar Administrador automáticamente.",
             }
