@@ -126,13 +126,14 @@ class DianSyncService:
         await page.wait_for_timeout(2000)
         return await page.content()
 
-    async def _query_documents(self, context: BrowserContext, html: str, start_date: str, end_date: Optional[str], max_documents: int) -> Dict[str, Any]:
-        token = find_request_verification_token(html)
-        if not token:
-            # A veces el token de formulario no aparece hasta evaluar la página.
-            token = ""
+    async def _query_documents(self, page: Page, start_date: str, end_date: Optional[str], max_documents: int) -> Dict[str, Any]:
+        """Consulta GetDocumentsPageToken desde el contexto real del navegador.
+
+        Hacerlo con page.evaluate(fetch) ayuda a que DIAN use las mismas cookies,
+        tokens antifalsificación y contexto JS de la página real.
+        """
         end = end_date or date.today().isoformat()
-        form = {
+        payload = {
             "draw": "1",
             "start": "0",
             "length": str(max_documents),
@@ -149,24 +150,37 @@ class DianSyncService:
             "blockIndex": "0",
             "RadianStatus": "0",
         }
-        if token:
-            form["__RequestVerificationToken"] = token
-        response = await context.request.post(
-            f"{DIAN_BASE}/Document/GetDocumentsPageToken",
-            form=form,
-            headers={
-                "x-requested-with": "XMLHttpRequest",
-                "origin": DIAN_BASE,
-                "referer": f"{DIAN_BASE}/Document/Received",
-            },
-            timeout=90_000,
+        result = await page.evaluate(
+            """async ({payload}) => {
+                const tokenEl = document.querySelector('input[name="__RequestVerificationToken"]');
+                const token = tokenEl ? tokenEl.value : '';
+                if (token) payload.__RequestVerificationToken = token;
+                const body = new URLSearchParams(payload).toString();
+                const res = await fetch('/Document/GetDocumentsPageToken', {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'x-requested-with': 'XMLHttpRequest'
+                    },
+                    body
+                });
+                const text = await res.text();
+                return {status: res.status, text, tokenFound: !!token, contentType: res.headers.get('content-type') || ''};
+            }""",
+            {"payload": payload},
         )
-        text = await response.text()
+        raw = result.get("text") or ""
         try:
-            data = json.loads(text)
+            data = json.loads(raw)
         except Exception:
-            data = {"raw": text}
-        return {"status": response.status, "data": data, "raw": text, "request_verification_token_found": bool(token)}
+            data = {"raw": raw}
+        return {
+            "status": result.get("status"),
+            "data": data,
+            "raw": raw,
+            "request_verification_token_found": bool(result.get("tokenFound")),
+            "content_type": result.get("contentType"),
+        }
 
     async def _dom_search_download_links(self, page: Page, start_date: str, end_date: Optional[str], max_documents: int) -> List[str]:
         """Fallback: usa la interfaz real para hacer Buscar y luego lee enlaces DownloadZipFiles del DOM."""
@@ -250,7 +264,7 @@ class DianSyncService:
         try:
             browser, context, page = await self._open_session(token_url)
             html = await self._get_received_page(page)
-            query = await self._query_documents(context, html, start_date, end_date, max_documents)
+            query = await self._query_documents(page, start_date, end_date, max_documents)
             candidates = extract_download_candidates(query["data"])
 
             if not candidates:
@@ -287,7 +301,7 @@ class DianSyncService:
                 "upload_result": upload_result,
                 "query_preview": query["raw"][:3000],
                 "query_data_keys": list(query["data"].keys()) if isinstance(query["data"], dict) else [],
-                "note": "Si download_candidates viene vacío, revisa query_preview: ahí veremos qué campos devuelve DIAN para mapear trackId/captcha.",
+                "note": "Si query_preview muestra HTML, DIAN devolvió una página en vez de JSON; si muestra JSON sin download_candidates, debemos mapear el campo exacto de descarga.",
             }
         finally:
             if browser:
