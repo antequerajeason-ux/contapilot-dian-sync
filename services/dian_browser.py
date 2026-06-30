@@ -168,6 +168,45 @@ class DianSyncService:
             data = {"raw": text}
         return {"status": response.status, "data": data, "raw": text, "request_verification_token_found": bool(token)}
 
+    async def _dom_search_download_links(self, page: Page, start_date: str, end_date: Optional[str], max_documents: int) -> List[str]:
+        """Fallback: usa la interfaz real para hacer Buscar y luego lee enlaces DownloadZipFiles del DOM."""
+        end = end_date or date.today().isoformat()
+        for selector, value in [
+            ('input[name="StartDate"]', start_date), ('#StartDate', start_date),
+            ('input[name="EndDate"]', end), ('#EndDate', end),
+        ]:
+            try:
+                loc = page.locator(selector).first
+                if await loc.count():
+                    await loc.fill(value)
+            except Exception:
+                pass
+        clicked = False
+        for selector in ['text=Buscar', 'button:has-text("Buscar")', 'input[value="Buscar"]']:
+            try:
+                await page.locator(selector).first.click(timeout=5000)
+                clicked = True
+                break
+            except Exception:
+                pass
+        if clicked:
+            await page.wait_for_timeout(5000)
+        links = await page.evaluate("""() => Array.from(document.querySelectorAll('a,button')).map(el => {
+            const href = el.href || el.getAttribute('href') || el.getAttribute('data-url') || el.getAttribute('onclick') || '';
+            return href;
+        }).filter(x => x && x.includes('DownloadZipFiles'))""")
+        normalized = []
+        for link in links:
+            link = str(link).replace('\\u0026','&').replace('&amp;','&')
+            m = re.search(r'/Document/DownloadZipFiles\?[^"\'<>\)]+', link)
+            if m:
+                link = DIAN_BASE + m.group(0)
+            if link.startswith('/Document/DownloadZipFiles'):
+                link = DIAN_BASE + link
+            if link.startswith('http') and link not in normalized:
+                normalized.append(link)
+        return normalized[:max_documents]
+
     async def _download_candidate(self, context: BrowserContext, url: str) -> DownloadedFile:
         res = await context.request.get(url, headers={"referer": f"{DIAN_BASE}/Document/Received"}, timeout=90_000)
         content = await res.body()
@@ -214,9 +253,12 @@ class DianSyncService:
             query = await self._query_documents(context, html, start_date, end_date, max_documents)
             candidates = extract_download_candidates(query["data"])
 
-            # Si el JSON no trae URLs, intentamos extraer links del DOM luego de ejecutar búsqueda manualmente desde la página.
             if not candidates:
                 candidates = extract_download_candidates(query["raw"])
+
+            if not candidates:
+                dom_links = await self._dom_search_download_links(page, start_date, end_date, max_documents)
+                candidates = [{"url": u, "source": "dom"} for u in dom_links]
 
             downloads: List[DownloadedFile] = []
             errors = []
@@ -226,7 +268,6 @@ class DianSyncService:
                     continue
                 try:
                     f = await self._download_candidate(context, c["url"])
-                    # Ignorar HTML de error si no es zip/xml/pdf.
                     downloads.append(f)
                 except Exception as exc:
                     errors.append({"candidate": c, "error": str(exc)})
@@ -244,7 +285,9 @@ class DianSyncService:
                 "downloaded": [{"name": f.name, "content_type": f.content_type, "size": len(f.content), "source_url": f.source_url} for f in downloads],
                 "errors": errors,
                 "upload_result": upload_result,
-                "note": "Si download_candidates viene vacío, necesitamos la respuesta JSON de GetDocumentsPageToken porque la DIAN puede no incluir la URL de descarga directamente.",
+                "query_preview": query["raw"][:3000],
+                "query_data_keys": list(query["data"].keys()) if isinstance(query["data"], dict) else [],
+                "note": "Si download_candidates viene vacío, revisa query_preview: ahí veremos qué campos devuelve DIAN para mapear trackId/captcha.",
             }
         finally:
             if browser:
