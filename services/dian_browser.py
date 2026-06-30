@@ -92,59 +92,45 @@ class DianSyncService:
         self.headless = headless
 
     async def _complete_dian_role_selection(self, page: Page) -> Dict[str, Any]:
-        """Después de AuthToken, DIAN a veces muestra una pantalla intermedia
-        para escoger rol/empresa (por ejemplo Administrador). Esta función intenta
-        avanzar automáticamente antes de ir a Document/Received.
+        """Después de AuthToken, DIAN puede mostrar una pantalla para seleccionar rol.
+        En el HTML observado, el enlace de Administrador apunta a /User/Com.
+        Esta versión intenta navegar explícitamente a /User/Com antes de entrar a documentos.
         """
         actions = []
-        for _ in range(5):
-            await page.wait_for_timeout(1200)
+        await page.wait_for_timeout(1200)
+        html = await page.content()
+        current = page.url
+
+        # Si vemos la pantalla de rol/administrador, ir directo al endpoint que activa el rol.
+        if 'Administrador' in html or 'login-wrapper' in html or '/User/Com' in html:
+            try:
+                await page.goto(f"{DIAN_BASE}/User/Com", wait_until="domcontentloaded", timeout=45_000)
+                actions.append({"goto": f"{DIAN_BASE}/User/Com", "from": current})
+                await page.wait_for_timeout(2500)
+            except Exception as exc:
+                actions.append({"goto_error": str(exc), "from": current})
+
+        # Si aún queda en pantalla intermedia, intentar clics conocidos.
+        for _ in range(3):
             html = await page.content()
             current = page.url
-            # Si ya estamos en una pantalla funcional, paramos.
-            if "/Document/" in current or "Documentos recibidos" in html or "Documentos enviados" in html or "Sistema de factura electrónica" in html and "login-wrapper" not in html:
+            if "/Document/" in current or "Documentos recibidos" in html or "Documentos enviados" in html:
                 break
-            candidates = [
-                'a[href*="/User/Com"]',
-                'a[href*="/User/Company"]',
-                'a[href*="/User/Set"]',
-                'a:has-text("Administrador")',
-                'a:has-text("Empresa")',
-                'a:has-text("Facturador")',
-                'button:has-text("Administrador")',
-                'button:has-text("Continuar")',
-                'input[value="Continuar"]',
-            ]
+            if 'Administrador' not in html and 'login-wrapper' not in html:
+                break
             clicked = False
-            for selector in candidates:
+            for selector in ['a[href="/User/Com"]', 'a[href*="/User/Com"]', 'a:has-text("Administrador")', 'button:has-text("Administrador")', 'button:has-text("Continuar")']:
                 try:
                     loc = page.locator(selector).first
                     if await loc.count():
                         await loc.click(timeout=5000)
                         actions.append({"clicked": selector, "from": current})
                         clicked = True
-                        await page.wait_for_timeout(1800)
+                        await page.wait_for_timeout(2500)
                         break
                 except Exception:
                     pass
             if not clicked:
-                # Último recurso: buscar links con /User/ en el DOM y navegar al primero relevante.
-                try:
-                    href = await page.evaluate("""() => {
-                        const links = Array.from(document.querySelectorAll('a'))
-                          .map(a => ({href:a.getAttribute('href')||'', text:(a.innerText||'').trim()}))
-                          .filter(x => x.href.includes('/User/') && !x.href.includes('Logout'));
-                        const preferred = links.find(x => /Administrador|Empresa|Company|Com/i.test(x.text + ' ' + x.href)) || links[0];
-                        return preferred ? preferred.href : '';
-                    }""")
-                    if href:
-                        if href.startswith('/'):
-                            href = DIAN_BASE + href
-                        await page.goto(href, wait_until="domcontentloaded", timeout=30000)
-                        actions.append({"goto": href, "from": current})
-                        continue
-                except Exception:
-                    pass
                 break
         return {"actions": actions, "url": page.url}
 
@@ -185,10 +171,10 @@ class DianSyncService:
         await page.wait_for_timeout(2000)
         # Si DIAN nos devolvió a una pantalla de selección, intentamos completar y regresar.
         html = await page.content()
-        if "login-wrapper" in html or "Administrador" in html and "/Document/Received" not in page.url:
+        if "login-wrapper" in html or ("Administrador" in html and "/Document/Received" not in page.url):
             await self._complete_dian_role_selection(page)
             await page.goto(f"{DIAN_BASE}/Document/Received", wait_until="domcontentloaded", timeout=90_000)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(2500)
         return await page.content()
 
     async def _query_documents(self, page: Page, start_date: str, end_date: Optional[str], max_documents: int) -> Dict[str, Any]:
@@ -360,6 +346,7 @@ class DianSyncService:
                 "company_nit": company_nit,
                 "query_status": query["status"],
                 "token_found": query["request_verification_token_found"],
+                "page_url_after_navigation": page.url,
                 "download_candidates": candidates,
                 "downloaded": [{"name": f.name, "content_type": f.content_type, "size": len(f.content), "source_url": f.source_url} for f in downloads],
                 "errors": errors,
