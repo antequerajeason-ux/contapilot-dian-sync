@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -192,13 +193,23 @@ class DianSyncService:
     async def _open_session(self, token_url: str) -> tuple[Browser, BrowserContext, Page]:
         validate_auth_url(token_url)
         pw = await async_playwright().start()
-        browser = await pw.chromium.launch(headless=self.headless)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36",
-            locale="es-CO",
-            viewport={"width": 1366, "height": 768},
-            accept_downloads=True,
-        )
+        ws_url = os.environ.get("BROWSERLESS_WS_URL") or os.environ.get("BROWSERLESS_CDP_URL")
+        if ws_url:
+            browser = await pw.chromium.connect_over_cdp(ws_url)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36",
+                locale="es-CO",
+                viewport={"width": 1366, "height": 768},
+                accept_downloads=True,
+            )
+        else:
+            browser = await pw.chromium.launch(headless=self.headless)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36",
+                locale="es-CO",
+                viewport={"width": 1366, "height": 768},
+                accept_downloads=True,
+            )
         page = await context.new_page()
         await page.goto(token_url, wait_until="domcontentloaded", timeout=90_000)
         # Dar tiempo al challenge/WAF si aparece y a redirecciones.
@@ -355,6 +366,56 @@ class DianSyncService:
                     payload = {"text": resp.text}
                 results.append({"file": f.name, "status_code": resp.status_code, "response": payload})
         return {"uploads": results}
+
+    async def sync_current_page(
+        self,
+        page: Page,
+        context: BrowserContext,
+        company_nit: str,
+        start_date: str,
+        end_date: Optional[str] = None,
+        max_documents: int = 25,
+        upload_url: Optional[str] = None,
+        bearer_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Sincroniza usando una página/sesión ya abierta por el usuario."""
+        html = await self._get_received_page(page)
+        query = await self._query_documents(page, start_date, end_date, max_documents)
+        candidates = extract_download_candidates(query["data"]) or extract_download_candidates(query["raw"])
+        captcha_token = await get_turnstile_or_captcha_token(page)
+        json_candidates = candidates_from_documents_json(query["data"], captcha_token)
+        if json_candidates:
+            candidates = json_candidates + candidates
+        if not candidates:
+            dom_links = await self._dom_search_download_links(page, start_date, end_date, max_documents)
+            candidates = [{"url": u, "source": "dom"} for u in dom_links]
+        downloads: List[DownloadedFile] = []
+        errors = []
+        for c in candidates[:max_documents]:
+            if not c.get("url"):
+                errors.append({"candidate": c, "error": "No hay URL de descarga completa; falta captcha o endpoint"})
+                continue
+            try:
+                downloads.append(await self._download_candidate(context, c["url"]))
+            except Exception as exc:
+                errors.append({"candidate": c, "error": str(exc)})
+        upload_result = None
+        if upload_url and bearer_token and downloads:
+            upload_result = await self._upload_to_contapilot(upload_url, bearer_token, downloads)
+        return {
+            "ok": True,
+            "company_nit": company_nit,
+            "query_status": query["status"],
+            "token_found": query["request_verification_token_found"],
+            "page_url_after_navigation": page.url,
+            "captcha_token_found": bool(captcha_token),
+            "download_candidates": candidates,
+            "downloaded": [{"name": f.name, "content_type": f.content_type, "size": len(f.content), "source_url": f.source_url} for f in downloads],
+            "errors": errors,
+            "upload_result": upload_result,
+            "query_preview": query["raw"][:3000],
+            "query_data_keys": list(query["data"].keys()) if isinstance(query["data"], dict) else [],
+        }
 
     async def sync_received_documents(
         self,

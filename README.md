@@ -127,3 +127,21 @@ Start command:
 ```bash
 uvicorn main:app --host 0.0.0.0 --port $PORT
 ```
+
+## Sesión remota asistida
+
+Endpoints nuevos:
+
+- `POST /sessions/start`: crea una sesión de navegador y abre el token DIAN.
+- `GET /sessions/{session_id}`: estado de la sesión.
+- `POST /sessions/sync`: sincroniza usando esa sesión ya abierta.
+- `POST /sessions/{session_id}/close`: cierra sesión.
+
+Para que el usuario vea el navegador y resuelva captcha, configura un proveedor remoto como Browserless y define:
+
+```txt
+BROWSERLESS_WS_URL=wss://...browserless...?token=...
+BROWSERLESS_LIVE_URL_TEMPLATE=https://.../live/{session_id}
+```
+
+La URL live depende del proveedor. Si `live_url` sale null, el servicio funciona para automatización, pero el usuario no podrá ver/controlar el navegador remoto.
