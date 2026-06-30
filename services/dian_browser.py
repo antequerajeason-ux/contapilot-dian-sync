@@ -91,6 +91,63 @@ class DianSyncService:
     def __init__(self, headless: bool = True):
         self.headless = headless
 
+    async def _complete_dian_role_selection(self, page: Page) -> Dict[str, Any]:
+        """Después de AuthToken, DIAN a veces muestra una pantalla intermedia
+        para escoger rol/empresa (por ejemplo Administrador). Esta función intenta
+        avanzar automáticamente antes de ir a Document/Received.
+        """
+        actions = []
+        for _ in range(5):
+            await page.wait_for_timeout(1200)
+            html = await page.content()
+            current = page.url
+            # Si ya estamos en una pantalla funcional, paramos.
+            if "/Document/" in current or "Documentos recibidos" in html or "Documentos enviados" in html or "Sistema de factura electrónica" in html and "login-wrapper" not in html:
+                break
+            candidates = [
+                'a[href*="/User/Com"]',
+                'a[href*="/User/Company"]',
+                'a[href*="/User/Set"]',
+                'a:has-text("Administrador")',
+                'a:has-text("Empresa")',
+                'a:has-text("Facturador")',
+                'button:has-text("Administrador")',
+                'button:has-text("Continuar")',
+                'input[value="Continuar"]',
+            ]
+            clicked = False
+            for selector in candidates:
+                try:
+                    loc = page.locator(selector).first
+                    if await loc.count():
+                        await loc.click(timeout=5000)
+                        actions.append({"clicked": selector, "from": current})
+                        clicked = True
+                        await page.wait_for_timeout(1800)
+                        break
+                except Exception:
+                    pass
+            if not clicked:
+                # Último recurso: buscar links con /User/ en el DOM y navegar al primero relevante.
+                try:
+                    href = await page.evaluate("""() => {
+                        const links = Array.from(document.querySelectorAll('a'))
+                          .map(a => ({href:a.getAttribute('href')||'', text:(a.innerText||'').trim()}))
+                          .filter(x => x.href.includes('/User/') && !x.href.includes('Logout'));
+                        const preferred = links.find(x => /Administrador|Empresa|Company|Com/i.test(x.text + ' ' + x.href)) || links[0];
+                        return preferred ? preferred.href : '';
+                    }""")
+                    if href:
+                        if href.startswith('/'):
+                            href = DIAN_BASE + href
+                        await page.goto(href, wait_until="domcontentloaded", timeout=30000)
+                        actions.append({"goto": href, "from": current})
+                        continue
+                except Exception:
+                    pass
+                break
+        return {"actions": actions, "url": page.url}
+
     async def _open_session(self, token_url: str) -> tuple[Browser, BrowserContext, Page]:
         validate_auth_url(token_url)
         pw = await async_playwright().start()
@@ -105,6 +162,7 @@ class DianSyncService:
         await page.goto(token_url, wait_until="domcontentloaded", timeout=90_000)
         # Dar tiempo al challenge/WAF si aparece y a redirecciones.
         await page.wait_for_timeout(3500)
+        await self._complete_dian_role_selection(page)
         return browser, context, page
 
     async def test_token(self, token_url: str) -> Dict[str, Any]:
@@ -122,8 +180,15 @@ class DianSyncService:
                 await browser.close()
 
     async def _get_received_page(self, page: Page) -> str:
+        await self._complete_dian_role_selection(page)
         await page.goto(f"{DIAN_BASE}/Document/Received", wait_until="domcontentloaded", timeout=90_000)
         await page.wait_for_timeout(2000)
+        # Si DIAN nos devolvió a una pantalla de selección, intentamos completar y regresar.
+        html = await page.content()
+        if "login-wrapper" in html or "Administrador" in html and "/Document/Received" not in page.url:
+            await self._complete_dian_role_selection(page)
+            await page.goto(f"{DIAN_BASE}/Document/Received", wait_until="domcontentloaded", timeout=90_000)
+            await page.wait_for_timeout(2000)
         return await page.content()
 
     async def _query_documents(self, page: Page, start_date: str, end_date: Optional[str], max_documents: int) -> Dict[str, Any]:
@@ -301,7 +366,8 @@ class DianSyncService:
                 "upload_result": upload_result,
                 "query_preview": query["raw"][:3000],
                 "query_data_keys": list(query["data"].keys()) if isinstance(query["data"], dict) else [],
-                "note": "Si query_preview muestra HTML, DIAN devolvió una página en vez de JSON; si muestra JSON sin download_candidates, debemos mapear el campo exacto de descarga.",
+                "session_or_role_page_detected": ("login-wrapper" in query["raw"] or "Administrador" in query["raw"]),
+                "note": "Si session_or_role_page_detected es true, DIAN devolvió pantalla de selección de rol/sesión en vez de JSON. El servicio intenta seleccionar Administrador automáticamente.",
             }
         finally:
             if browser:
