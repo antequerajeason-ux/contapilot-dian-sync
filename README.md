@@ -90,3 +90,40 @@ Este servicio ya implementa:
 6. Enviar ZIPs a ContaPilot si se configura callback.
 
 Si la respuesta de `GetDocumentsPageToken` no trae la URL de descarga, necesitamos copiar la pestaña `Response` de esa petición para mapear el campo exacto que contiene `trackId/captcha`.
+
+## Corrección Render: error greenlet / g++
+
+Si Render falla con:
+
+```txt
+Failed building wheel for greenlet
+command '/usr/bin/g++' failed
+```
+
+normalmente es porque Render está usando Python 3.13 y alguna dependencia de Playwright/greenlet no tiene wheel compatible.
+
+Solución incluida:
+
+```txt
+runtime.txt
+```
+
+con:
+
+```txt
+python-3.11.9
+```
+
+En Render usa:
+
+Build command:
+
+```bash
+python -m pip install --upgrade pip setuptools wheel && pip install -r requirements.txt && playwright install chromium
+```
+
+Start command:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port $PORT
+```
