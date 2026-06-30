@@ -73,13 +73,28 @@ async def start_remote_session(data: RemoteStartIn):
         service = DianSyncService(headless=False)
         browser, context, page = await service._open_session(data.token_url)
         session_id = str(uuid.uuid4())
+        live_url = None
+        live_url_id = None
+        try:
+            cdp = await context.new_cdp_session(page)
+            live = await cdp.send("Browserless.liveURL", {"timeout": 900000})
+            live_url = live.get("liveURL")
+            live_url_id = live.get("liveURLId")
+        except Exception as live_exc:
+            # Si Browserless/liveURL no está disponible, la sesión queda creada pero sin link visual.
+            live_url = None
         SESSIONS[session_id] = {
             "service": service, "browser": browser, "context": context, "page": page,
-            "company_nit": data.company_nit, "start_date": data.start_date, "end_date": data.end_date, "max_documents": data.max_documents
+            "company_nit": data.company_nit, "start_date": data.start_date, "end_date": data.end_date,
+            "max_documents": data.max_documents, "live_url": live_url, "live_url_id": live_url_id
         }
-        live_template = os.environ.get("BROWSERLESS_LIVE_URL_TEMPLATE", "")
-        live_url = live_template.replace("{session_id}", session_id) if live_template else None
-        return {"ok": True, "session_id": session_id, "current_url": page.url, "live_url": live_url, "note": "Si live_url es null, configura Browserless/servicio de navegador remoto para que el usuario pueda resolver captcha visualmente."}
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "current_url": page.url,
+            "live_url": live_url,
+            "note": "Abre live_url para resolver captcha/entrar a DIAN. Luego vuelve a ContaPilot y presiona Continuar sincronización."
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -90,7 +105,7 @@ async def get_remote_session(session_id: str):
     if not s:
         raise HTTPException(404, "Sesión no encontrada o expirada")
     page = s["page"]
-    return {"ok": True, "session_id": session_id, "url": page.url}
+    return {"ok": True, "session_id": session_id, "url": page.url, "live_url": s.get("live_url")}
 
 
 @app.post("/sessions/sync")
